@@ -81,8 +81,9 @@ def design_bridge(params, design_code="AASHTO"):
     else:
         design = design_beam_bridge(dims, params, design_code)
 
-    # Common to all types
-    design["bridge_type"] = bridge_type
+    # Common to all types (preserve type from specific designer if already set)
+    if "bridge_type" not in design:
+        design["bridge_type"] = bridge_type
     design["design_code"] = "AASHTO LRFD" if design_code == "AASHTO" else "JTG D60-2015"
     # Carry forward dimensions for downstream consumers (FEA, drawings)
     design["dimensions"] = dims
@@ -120,13 +121,14 @@ def design_beam_bridge(dims, params, code):
         # Long spans: prestressed concrete I-girder (AASHTO standard)
         return design_prestressed_bridge(dims, params, code)
     elif span <= 150:
-        # Extended spans: steel plate girder
         return design_steel_girder_bridge(dims, params, code)
+    elif span <= 400:
+        return design_cable_stayed_bridge(dims, params, code)
     else:
-        print(f"\n  ⚠ {span}m exceeds practical simple-span range (>150m)")
-        print(f"     Consider: cable-stayed, arch, or suspension bridge")
-        print(f"     Attempting steel girder as lower bound...")
-        return design_steel_girder_bridge(dims, params, code)
+        print(f"\n  ⚠ {span}m exceeds cable-stayed range (>400m)")
+        print(f"     Consider: suspension bridge")
+        print(f"     Attempting cable-stayed as lower bound...")
+        return design_cable_stayed_bridge(dims, params, code)
 
     girder_depth = round(girder_depth, 2)
     girder_spacing = round(width / num_girders, 2)
@@ -1145,6 +1147,120 @@ def design_steel_girder_bridge(dims, params, code):
 
 
 # ============================================================================
+# Cable-Stayed Bridge Preliminary Design (150-400m spans)
+# Simplified: fan-pattern stay cables, single pylon
+# ============================================================================
+
+def design_cable_stayed_bridge(dims, params, code):
+    """Preliminary design of cable-stayed bridge for spans 150-400m.
+
+    Uses simplified fan-pattern cable arrangement. Computes pylon height,
+    cable forces, deck section, and checks feasibility.
+    """
+
+    span = dims["span_length"]
+    width = dims["deck_width"]
+    clearance = dims.get("clearance_under_bridge", 15.0)
+
+    print("\n[1/5] Cable-Stayed Bridge — Preliminary Design")
+    print("-" * 40)
+
+    main_span = span * 0.65
+    back_span = span - main_span
+
+    pylon_height = round(main_span / 4.5, 1)
+    pylon_w = max(2.0, width / 8)
+    pylon_d = max(3.0, pylon_height / 15)
+    pylon_wall = 0.4
+
+    n_cables_per_side = max(6, int(main_span / 15))
+    cable_spacing = main_span / n_cables_per_side
+
+    deck_thickness = 0.250
+    deck_w_knm = width * deck_thickness * 25 * 9.81 / 1000 + 9.0
+
+    cable_load = deck_w_knm * cable_spacing
+    max_angle = math.atan(pylon_height / main_span)
+    min_angle = math.atan(pylon_height / (cable_spacing * 2))
+    avg_angle = (max_angle + min_angle) / 2
+    cable_force = cable_load / math.sin(avg_angle)
+    cable_stress = 835.0
+    cable_area = cable_force * 1000 / cable_stress
+
+    total_cable_len = 0
+    for i in range(1, n_cables_per_side + 1):
+        total_cable_len += math.sqrt((i * cable_spacing)**2 + pylon_height**2) * 2
+    cable_steel_t = total_cable_len * cable_area * 7850 / 1e9
+
+    M_deck = deck_w_knm * cable_spacing**2 / 10
+    I_deck = width * deck_thickness**3 / 12
+    delta_deck = 5 * deck_w_knm * cable_spacing**4 / (384 * 3.0e7 * I_deck) * 1000
+    delta_limit = cable_spacing * 1000 / 800
+
+    pylon_area = 2 * (pylon_w + pylon_d) * pylon_wall
+    pylon_stress = deck_w_knm * main_span / pylon_area / 1000
+    pylon_allow = 0.3 * 40  # MPa
+    pylon_ok = pylon_stress < pylon_allow
+
+    print(f"  Main span: {main_span:.0f}m, Pylon: {pylon_height}m above deck")
+    print(f"  Cables: {n_cables_per_side} pairs/side @ {cable_spacing:.0f}m")
+    print(f"  Cable force: {cable_force:.0f} kN, area: {cable_area:.0f} mm²")
+    print(f"  Deck deflection: {delta_deck:.1f}mm vs {delta_limit:.0f}mm → {'OK' if delta_deck < delta_limit else 'CHECK'}")
+    print(f"  Pylon stress: {pylon_stress:.1f}MPa vs {pylon_allow:.0f}MPa → {'OK' if pylon_ok else 'CHECK'}")
+    print(f"  Cable steel: {cable_steel_t:.1f} tonnes")
+    print(f"  ⚠ PRELIMINARY ONLY — final design requires nonlinear FEM")
+
+    deck_conc = span * width * deck_thickness
+    pylon_conc = pylon_height * pylon_area * 2
+    total_conc = deck_conc + pylon_conc
+
+    return {
+        "bridge_type": "cable_stayed",
+        "design_code": "",
+        "superstructure": {
+            "girder_type": "Cable-Stayed (Fan Pattern)",
+            "main_span_m": round(main_span, 0),
+            "back_span_m": round(back_span, 0),
+            "pylon_height_m": pylon_height,
+            "pylon_section": f"{pylon_w:.1f}x{pylon_d:.1f}m hollow",
+            "n_cables_per_side": n_cables_per_side,
+            "cable_spacing_m": round(cable_spacing, 1),
+            "cable_type": "Grade 1860 parallel strand",
+            "deck_thickness": deck_thickness,
+            "deck_width": width,
+        },
+        "substructure": {
+            "pylon_foundation": f"caisson/pile group, depth > {pylon_height*0.3:.0f}m",
+            "abutments": [
+                {"type": "anchorage", "note": "Back span end anchor"},
+                {"type": "expansion", "note": "Main span expansion joint"},
+            ],
+        },
+        "reinforcement": {
+            "stay_cables": f"{n_cables_per_side*2} cables, {cable_area:.0f}mm² each",
+            "note": "PRELIMINARY — requires nonlinear FEM",
+        },
+        "quantities": {
+            "concrete_m3": {"deck": round(deck_conc, 0), "pylons": round(pylon_conc, 0)},
+            "cable_steel_tonnes": round(cable_steel_t, 1),
+            "total_concrete_m3": round(total_conc, 0),
+        },
+        "loads": {
+            "deck_load_kN_per_m": round(deck_w_knm, 1),
+            "cable_force_max_kN": round(cable_force, 0),
+            "pylon_axial_kN": round(deck_w_knm * main_span, 0),
+        },
+        "analysis": {
+            "deck_deflection_mm": round(delta_deck, 1),
+            "deck_deflection_ok": delta_deck < delta_limit,
+            "pylon_stress_mpa": round(pylon_stress, 1),
+            "pylon_ok": pylon_ok,
+            "note": "PRELIMINARY DESIGN ONLY — requires nonlinear FEM for final design",
+        },
+    }
+
+
+# ============================================================================
 # Load Calculations
 # ============================================================================
 
@@ -1308,7 +1424,7 @@ def analyze_beam_bridge(span, w_dead, w_super, M_ll, V_ll, num_girders,
         flange_t = girder_depth * 0.12
         web_t = girder_depth * 0.08
     elif girder_type == "T-beam":
-        flange_w = girder_spacing(girder_depth * 0.12)
+        flange_w = 1.8  # Typical T-beam flange width for deflection calc
         flange_t = 0.20
         web_t = 0.30
     else:

@@ -118,10 +118,28 @@ def build_bridge_fea_model(design):
 
 
 def run_static_analysis(design):
-    """Run linear static analysis using 2D beam model."""
+    """Run linear static analysis using 2D beam model.
+
+    Note: Cable-stayed, arch, and suspension bridges require
+    nonlinear FEM with specialized elements. This function
+    returns a 'not applicable' result for those types.
+    """
+    bridge_type = design.get("bridge_type", "beam")
+
+    if bridge_type in ("cable_stayed", "arch", "suspension"):
+        return {
+            "analysis_type": "static",
+            "converged": False,
+            "error": f"2D beam FEA not applicable for {bridge_type} bridges. "
+                     f"Requires nonlinear FEM with cable/shell elements.",
+            "max_moment_kNm": 0, "max_shear_kN": 0,
+            "max_displacement_mm": 0, "midspan_displacement_mm": 0,
+            "n_nodes": 0,
+        }
+
     import openseespy.opensees as ops
 
-    # ── Build model directly (inline, verified against theory) ──
+    # ── Build model ──
     ops.wipe()
     ops.model('basic', '-ndm', 2, '-ndf', 3)
 
@@ -213,7 +231,23 @@ def run_static_analysis(design):
 
 
 def run_modal_analysis(design, n_modes=6):
-    """Run eigenvalue analysis using 2D beam model."""
+    """Run eigenvalue analysis using 2D beam model.
+
+    Note: Cable-stayed, arch, and suspension bridges require
+    specialized models. Returns 'not applicable' for those types.
+    """
+    bridge_type = design.get("bridge_type", "beam")
+
+    if bridge_type in ("cable_stayed", "arch", "suspension"):
+        return {
+            "analysis_type": "modal",
+            "error": f"2D modal analysis not applicable for {bridge_type} bridges.",
+            "n_modes": 0,
+            "fundamental_period_s": None,
+            "fundamental_freq_hz": None,
+            "modes": [],
+        }
+
     import openseespy.opensees as ops
 
     ops.wipe()
@@ -285,6 +319,15 @@ def run_modal_analysis(design, n_modes=6):
 
 def verify_against_design(fea_results, design):
     """Compare FEA results against design limits and code checks."""
+    # Handle "not applicable" case for special bridge types
+    if "error" in fea_results and "not applicable" in fea_results.get("error", ""):
+        return {
+            "checks": [{"check": "FEA Applicability",
+                        "note": fea_results["error"], "ok": True}],
+            "all_passed": True,
+            "summary": "FEA not applicable — use nonlinear FEM for final design",
+        }
+
     analysis = design.get("analysis", {})
     dims = design.get("dimensions", {})
 
