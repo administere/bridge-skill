@@ -84,6 +84,8 @@ def design_bridge(params, design_code="AASHTO"):
     # Common to all types
     design["bridge_type"] = bridge_type
     design["design_code"] = "AASHTO LRFD" if design_code == "AASHTO" else "JTG D60-2015"
+    # Carry forward dimensions for downstream consumers (FEA, drawings)
+    design["dimensions"] = dims
 
     # Terrain-adaptive foundation depths
     design = adapt_to_terrain(design, terrain, dims)
