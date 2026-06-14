@@ -1,0 +1,23 @@
+{
+  "description": "Bridge Skill — UAV survey to construction drawing pipeline",
+  "skills": {
+    "bridge-skill": {
+      "description": "Process drone/UAV point clouds to generate bridge 3D models and construction drawings",
+      "path": ".claude/skills/bridge-skill.md",
+      "triggers": [
+        "bridge survey",
+        "bridge point cloud",
+        "bridge drawing",
+        "bridge model",
+        "uav bridge",
+        "drone bridge",
+        "桥梁",
+        "点云处理",
+        "施工图"
+      ]
+    }
+  },
+  "hooks": {
+    "PostToolUse": []
+  }
+}
