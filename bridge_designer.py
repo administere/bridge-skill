@@ -186,7 +186,8 @@ def design_beam_bridge(dims, params, code):
     print("-" * 40)
 
     analysis = analyze_beam_bridge(span, w_dead, w_super, M_ll, V_ll, num_girders,
-                                    girder_depth, girder_type, concrete=CONCRETE_C40)
+                                    girder_depth, girder_type, concrete=CONCRETE_C40,
+                                    span_segments=dims.get("span_segments"))
 
     Mu = analysis["Mu_total_kNm"]
     Vu = analysis["Vu_total_kN"]
@@ -281,6 +282,8 @@ def design_beam_bridge(dims, params, code):
             "max_deflection_mm": round(deflection, 1),
             "deflection_limit_mm": round(defl_limit, 1),
             "deflection_ok": deflection < defl_limit,
+            "beam_type": analysis.get("beam_type", "simple span"),
+            "is_continuous": analysis.get("is_continuous", False),
         },
     }
 
@@ -1514,53 +1517,47 @@ def calculate_arch_loads(span, width, num_ribs, rib_width, rib_depth,
 # ============================================================================
 
 def analyze_beam_bridge(span, w_dead, w_super, M_ll, V_ll, num_girders,
-                         girder_depth, girder_type, concrete):
-    """Perform structural analysis of a beam bridge."""
+                         girder_depth, girder_type, concrete,
+                         span_segments=None):
+    """Structural analysis — simple span or continuous beam.
 
-    # Load factors (AASHTO LRFD Strength I)
-    gamma_dc = 1.25
-    gamma_dw = 1.50
-    gamma_ll = 1.75
+    When span_segments has >1 entries, uses continuous beam coefficients.
+    Continuous beams reduce design moments 30-50% vs simple span.
+    """
 
-    # Total factored distributed load
-    w_factored = gamma_dc * w_dead + gamma_dw * w_super
+    is_continuous = span_segments and len(span_segments) >= 2
+    gamma_dc = 1.25; gamma_dw = 1.50; gamma_ll = 1.75
 
-    # Simple span moments
-    M_dc = w_dead * span ** 2 / 8
-    M_dw = w_super * span ** 2 / 8
-    M_factored_dl = w_factored * span ** 2 / 8
-
-    Mu_total = gamma_dc * M_dc + gamma_dw * M_dw + gamma_ll * M_ll
-    Mu_per_girder = Mu_total / num_girders
-
-    # Shear
-    V_dc = w_dead * span / 2
-    V_dw = w_super * span / 2
-    Vu_total = gamma_dc * V_dc + gamma_dw * V_dw + gamma_ll * V_ll
-    Vu_per_girder = Vu_total / num_girders
-
-    # Deflection (live load only, service)
-    Ec = concrete["ec_gpa"] * 1e6  # kPa
-    if girder_type == "I-beam":
-        flange_w = girder_depth * 0.5
-        flange_t = girder_depth * 0.12
-        web_t = girder_depth * 0.08
-    elif girder_type == "T-beam":
-        flange_w = 1.8  # Typical T-beam flange width for deflection calc
-        flange_t = 0.20
-        web_t = 0.30
+    if is_continuous:
+        Lmax = max(span_segments); n = len(span_segments)
+        c_neg = 1/10 if n == 3 else (1/9 if n == 2 else 1/11)
+        M_dc = w_dead * Lmax**2 * c_neg
+        M_dw = w_super * Lmax**2 * c_neg
+        M_ll_adj = M_ll * c_neg * 8  # Adjust from simple-span wL²/8 basis
+        Mu_total = gamma_dc * M_dc + gamma_dw * M_dw + gamma_ll * M_ll_adj
+        Mu_per_girder = Mu_total / num_girders
+        V_dc = 1.15 * w_dead * Lmax / 2
+        V_dw = 1.15 * w_super * Lmax / 2
+        Vu_total = gamma_dc * V_dc + gamma_dw * V_dw + gamma_ll * V_ll
+        Vu_per_girder = Vu_total / num_girders
+        Ec = concrete["ec_gpa"] * 1e6
+        I_girder = max(girder_depth**3 * 0.05, 0.01)
+        w_ll = 9.3 * max(1, int(8.0/3.6)) / num_girders
+        deflection = w_ll * Lmax**4 / (185 * Ec * I_girder) * 1000
+        beam_type = f"continuous ({n} spans)"
     else:
-        flange_w = girder_depth * 0.5
-        flange_t = 0.20
-        web_t = 0.30
-
-    # Approximate I based on rectangular section
-    I_girder = girder_depth ** 3 * 0.05  # Simplified moment of inertia
-    I_girder = max(I_girder, 0.01)
-
-    # Deflection = 5*w*L^4/(384*E*I) for simple span
-    w_ll_distributed = 9.3 * max(1, int(8.0 / 3.6)) / num_girders
-    deflection = 5 * w_ll_distributed * span ** 4 / (384 * Ec * I_girder) * 1000  # mm
+        M_dc = w_dead * span**2 / 8
+        M_dw = w_super * span**2 / 8
+        Mu_total = gamma_dc * M_dc + gamma_dw * M_dw + gamma_ll * M_ll
+        Mu_per_girder = Mu_total / num_girders
+        V_dc = w_dead * span / 2; V_dw = w_super * span / 2
+        Vu_total = gamma_dc * V_dc + gamma_dw * V_dw + gamma_ll * V_ll
+        Vu_per_girder = Vu_total / num_girders
+        Ec = concrete["ec_gpa"] * 1e6
+        I_girder = max(girder_depth**3 * 0.05, 0.01)
+        w_ll = 9.3 * max(1, int(8.0/3.6)) / num_girders
+        deflection = 5 * w_ll * span**4 / (384 * Ec * I_girder) * 1000
+        beam_type = "simple span"
 
     return {
         "Mu_total_kNm": round(Mu_total, 0),
@@ -1568,6 +1565,8 @@ def analyze_beam_bridge(span, w_dead, w_super, M_ll, V_ll, num_girders,
         "Vu_total_kN": round(Vu_total, 0),
         "Vu_per_girder_kN": round(Vu_per_girder, 0),
         "deflection_mm": round(deflection, 1),
+        "beam_type": beam_type,
+        "is_continuous": is_continuous,
     }
 
 
