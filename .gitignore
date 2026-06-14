@@ -1,0 +1,33 @@
+# Large data files (excluded from git)
+*.las
+*.laz
+*.FCStd
+*.step
+*.stl
+*.svg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Conda
+.env/
+
+# FreeCAD
+*.FCStd1
+*.fcstd
+freecad_config.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output directories
+bridge_output/
+output/
+*_output/
