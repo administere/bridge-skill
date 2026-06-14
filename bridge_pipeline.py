@@ -19,6 +19,7 @@ import json
 import argparse
 from pathlib import Path
 from scipy.spatial import ConvexHull
+from scipy.optimize import curve_fit
 
 
 def load_point_cloud(las_path):
@@ -217,18 +218,86 @@ def compute_deck_from_plane(deck_plane):
 
 
 def find_piers_abutments(non_plane_pcd, deck_elevation, ground_elevation,
-                         deck_info=None, eps=0.5, min_points=30):
+                         deck_info=None, eps=0.5, min_points=30,
+                         original_pcd=None):
     """Cluster remaining points (after removing ground and deck) to find piers and abutments.
 
     Uses deck extent to distinguish:
     - Piers: vertical structures within the deck span (interior)
     - Abutments: vertical structures at the deck ends
+
+    When RANSAC absorbs pier base points into ground plane, falls back to
+    Z-based filtering on the original point cloud for vertical structure detection.
     """
     print(f"\n[4/6] Finding piers and abutments...")
 
     points = np.asarray(non_plane_pcd.points)
+
+    # ── Primary detection from non-plane points ──
+    piers, abutments = _cluster_piers(points, deck_elevation, ground_elevation,
+                                       deck_info, eps, min_points)
+
+    # ── Fallback: if few/no piers found, search original cloud by Z range ──
+    if len(piers) < 1 and original_pcd is not None:
+        print("  Primary search found 0 piers, trying Z-based fallback...")
+        orig_pts = np.asarray(original_pcd.points)
+
+        # Use deck XY extent to narrow search area
+        if deck_info:
+            d_start = np.array(deck_info['start'][:2])
+            d_end = np.array(deck_info['end'][:2])
+            d_axis = np.array(deck_info['axis_direction'])
+            d_perp = np.array(deck_info['perpendicular_direction'])
+            d_len = deck_info['length']
+            d_wid = deck_info['width']
+
+            # Project all points onto bridge axis
+            proj_axis = (orig_pts[:, :2] - d_start) @ d_axis
+            proj_perp = (orig_pts[:, :2] - d_start) @ d_perp
+
+            # XY mask: within deck bounds + 2m margin
+            xy_mask = (proj_axis > -2) & (proj_axis < d_len + 2) & \
+                      (np.abs(proj_perp) < d_wid/2 + 2)
+
+            # Z mask: exclude ground, include pier tops just below deck
+            z_mask = (orig_pts[:, 2] > ground_elevation + 0.2) & \
+                     (orig_pts[:, 2] < deck_elevation - 0.05)
+
+            mid_pts = orig_pts[xy_mask & z_mask]
+            n_filtered = len(mid_pts)
+            print(f"  XY+Z-filtered cloud: {n_filtered:,} points in bridge footprint")
+
+            if n_filtered > min_points * 3:
+                piers2, abutments2 = _cluster_piers(mid_pts, deck_elevation,
+                                                      ground_elevation, deck_info,
+                                                      eps * 0.8, min_points)
+                # Filter by height: piers must be taller than 1/3 clearance
+                min_pier_h = max(1.5, (deck_elevation - ground_elevation) * 0.3)
+                valid_piers = [p for p in piers2 if p.get('height', 0) > min_pier_h]
+                if valid_piers:
+                    piers = valid_piers
+                    print(f"  Fallback found {len(piers)} piers ({len(piers2)} candidates, "
+                          f"min_height={min_pier_h:.1f}m)")
+                if len(abutments2) > len(abutments):
+                    abutments = abutments2
+        else:
+            # No deck info, use simple Z range
+            z_mask = (orig_pts[:, 2] > ground_elevation + 0.3) & \
+                     (orig_pts[:, 2] < deck_elevation - 0.3)
+            mid_pts = orig_pts[z_mask]
+            if len(mid_pts) > min_points:
+                piers2, _ = _cluster_piers(mid_pts, deck_elevation,
+                                            ground_elevation, deck_info, eps, min_points)
+                if piers2:
+                    piers = piers2
+
+    return piers, abutments
+
+
+def _cluster_piers(points, deck_elevation, ground_elevation, deck_info,
+                   eps, min_points):
+    """Internal: cluster points into piers and abutments."""
     if len(points) < min_points:
-        print("  Not enough points for pier detection")
         return [], []
 
     # Get deck extent
@@ -239,8 +308,10 @@ def find_piers_abutments(non_plane_pcd, deck_elevation, ground_elevation,
         deck_x_min = min(deck_start_x, deck_end_x)
         deck_x_max = max(deck_start_x, deck_end_x)
 
-    # DBSCAN on remaining points
-    labels = np.array(non_plane_pcd.cluster_dbscan(
+    # DBSCAN on points
+    pcd_temp = o3d.geometry.PointCloud()
+    pcd_temp.points = o3d.utility.Vector3dVector(points)
+    labels = np.array(pcd_temp.cluster_dbscan(
         eps=eps, min_points=min_points, print_progress=False
     ))
 
@@ -389,13 +460,243 @@ def extract_dimensions(deck_info, piers, ground_elevation, deck_elevation, all_p
     return dims
 
 
-def determine_bridge_type(deck_info, piers, args_type):
-    """Determine bridge type from geometry."""
+def determine_bridge_type(deck_info, piers, args_type, deck_points=None):
+    """Determine bridge type from geometry and curvature analysis."""
     if args_type != "auto":
         return args_type
+
+    # Check for arch via curvature detection
+    if deck_points is not None and len(deck_points) > 100:
+        is_arch, curvature_score = detect_arch_curvature(deck_points)
+        if is_arch:
+            print(f"  Arch curvature detected (score={curvature_score:.3f})")
+            return "arch"
+
     if deck_info and deck_info['length'] < 20 and len(piers) == 0:
         return "arch"
     return "beam"
+
+
+# ============================================================================
+# NEW: Terrain Profile Extraction
+# ============================================================================
+
+def extract_terrain_profile(ground_plane, deck_info, num_samples=40):
+    """Extract terrain elevation profile along bridge centerline.
+
+    Uses ground plane points and samples elevation along the bridge axis
+    to build a longitudinal terrain profile for foundation design.
+
+    Args:
+        ground_plane: dict with 'pcd' (ground point cloud)
+        deck_info: dict with 'start', 'end', 'axis_direction'
+        num_samples: number of sample points along centerline
+
+    Returns:
+        List of {x, z} points representing terrain profile
+    """
+    if ground_plane is None or deck_info is None:
+        return []
+
+    ground_pts = np.asarray(ground_plane['pcd'].points)
+
+    # Bridge centerline in XY
+    start = np.array(deck_info['start'][:2])
+    end = np.array(deck_info['end'][:2])
+    axis = np.array(deck_info['axis_direction'])
+    length = deck_info['length']
+
+    profile = []
+    for i in range(num_samples):
+        t = i / (num_samples - 1)
+        sample_xy = start + t * (end - start)
+
+        # Find ground points within 1m bandwidth of this sample
+        perp = np.array([-axis[1], axis[0]])
+        distances = np.abs((ground_pts[:, :2] - sample_xy) @ perp)
+        along_dist = np.abs((ground_pts[:, :2] - sample_xy) @ axis)
+
+        nearby = ground_pts[(distances < 1.5) & (along_dist < 2.0)]
+        if len(nearby) > 5:
+            # Use median Z of nearby ground points
+            z_median = float(np.median(nearby[:, 2]))
+            profile.append({
+                "x": round(float(sample_xy[0]), 2),
+                "y": round(float(sample_xy[1]), 2),
+                "z": round(z_median, 2),
+                "n_points": len(nearby),
+            })
+
+    if len(profile) > 0:
+        z_range = max(p["z"] for p in profile) - min(p["z"] for p in profile)
+        print(f"\n  Terrain profile: {len(profile)} samples, "
+              f"Z range: {z_range:.2f}m, "
+              f"min Z: {min(p['z'] for p in profile):.2f}m, "
+              f"max Z: {max(p['z'] for p in profile):.2f}m")
+
+    return profile
+
+
+# ============================================================================
+# NEW: Vegetation Pre-filtering
+# ============================================================================
+
+def filter_by_classification(points, las_file_path, pcd=None):
+    """Use LAS classification labels to exclude vegetation points.
+
+    LAS classification:
+      2 = Ground, 3 = Low Vegetation, 4 = Medium Vegetation,
+      5 = High Vegetation, 6 = Building (bridge structure), 9 = Water
+
+    Returns:
+        structure_pcd: points classified as structure/ground/water
+        veg_pcd: points classified as vegetation (excluded from pier detection)
+        veg_mask: boolean mask on original points array
+    """
+    try:
+        las = laspy.read(las_file_path)
+        if not hasattr(las, 'classification'):
+            print("  No classification data in LAS file, skipping veg filter")
+            return pcd, None, np.zeros(len(points), dtype=bool)
+
+        class_ids = np.array(las.classification)
+
+        # Need to align with downsampled points
+        if len(class_ids) != len(points):
+            print(f"  Classification array size mismatch ({len(class_ids)} vs {len(points)}), "
+                  f"applying filter on raw points")
+            # Create mask for vegetation classes
+            veg_classes = [3, 4, 5]
+            veg_mask_raw = np.isin(class_ids, veg_classes)
+            structure_mask_raw = ~veg_mask_raw
+
+            veg_count = veg_mask_raw.sum()
+            total = len(class_ids)
+            print(f"  Vegetation points: {veg_count:,}/{total:,} ({100*veg_count/total:.1f}%)")
+
+            # For downsampled points, approximate by spatial matching
+            # Return masks for raw points — caller handles alignment
+            return pcd, veg_mask_raw, structure_mask_raw
+        else:
+            veg_classes = [3, 4, 5]
+            veg_mask = np.isin(class_ids, veg_classes)
+            veg_count = veg_mask.sum()
+            total = len(class_ids)
+            print(f"  Vegetation points: {veg_count:,}/{total:,} ({100*veg_count/total:.1f}%)")
+
+            if veg_count > 0 and pcd is not None:
+                veg_pts = points[veg_mask]
+                structure_pts = points[~veg_mask]
+                veg_pcd = o3d.geometry.PointCloud()
+                veg_pcd.points = o3d.utility.Vector3dVector(veg_pts)
+                pcd_down = o3d.geometry.PointCloud()
+                pcd_down.points = o3d.utility.Vector3dVector(structure_pts)
+                print(f"  Structure/non-veg points after filter: {len(structure_pts):,}")
+                return pcd_down, veg_pcd, veg_mask
+
+    except Exception as e:
+        print(f"  Classification filtering skipped: {e}")
+
+    return pcd, None, np.zeros(len(points), dtype=bool)
+
+
+# ============================================================================
+# NEW: Arch Shape Detection
+# ============================================================================
+
+def detect_arch_curvature(deck_points, min_curvature=0.003, min_r2=0.6):
+    """Detect if deck surface follows a parabolic arch shape.
+
+    Fits a 2nd-order polynomial (parabola) to the deck points along the
+    bridge axis and checks if the curvature is significant enough to be an arch.
+
+    Args:
+        deck_points: (N, 3) array of deck plane points
+        min_curvature: minimum quadratic coefficient to classify as arch
+        min_r2: minimum R² for the parabolic fit
+
+    Returns:
+        (is_arch: bool, curvature_score: float)
+    """
+    if len(deck_points) < 50:
+        return False, 0.0
+
+    # Project to 2D: along-axis (X) vs elevation (Z)
+    xy = deck_points[:, :2]
+    z = deck_points[:, 2]
+
+    # Find principal axis
+    centered = xy - xy.mean(axis=0)
+    cov = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    main_axis = eigenvectors[:, -1]
+
+    # Project points onto main axis
+    proj = centered @ main_axis
+    x_norm = (proj - proj.min()) / (proj.max() - proj.min() + 1e-10)
+
+    # Fit 2nd order polynomial: z = a*x^2 + b*x + c
+    try:
+        coeffs = np.polyfit(x_norm, z, 2)
+        a, b, c = coeffs
+
+        # R² of fit
+        z_pred = np.polyval(coeffs, x_norm)
+        ss_res = np.sum((z - z_pred) ** 2)
+        ss_tot = np.sum((z - z.mean()) ** 2)
+        r2 = 1 - ss_res / (ss_tot + 1e-10)
+
+        # Curvature magnitude (absolute 2nd derivative)
+        curvature = abs(a)
+
+        # Arch bridge: significant negative curvature (deck arches upward)
+        # or positive curvature with strong R²
+        is_arch = (curvature > min_curvature and r2 > min_r2)
+
+        return is_arch, round(float(curvature), 4)
+
+    except Exception:
+        return False, 0.0
+
+
+# ============================================================================
+# NEW: Multi-span detection
+# ============================================================================
+
+def compute_multi_span(piers, deck_info):
+    """Compute individual span segments for multi-span bridges.
+
+    Args:
+        piers: list of pier dicts with 'x' position
+        deck_info: dict with 'start' and 'end'
+
+    Returns:
+        List of span lengths between consecutive supports (abutment-pier, pier-pier, pier-abutment)
+    """
+    if not piers or not deck_info:
+        return []
+
+    # Sort piers by X position
+    sorted_piers = sorted(piers, key=lambda p: p['x'])
+
+    start_x = min(deck_info['start'][0], deck_info['end'][0])
+    end_x = max(deck_info['start'][0], deck_info['end'][0])
+
+    spans = []
+    prev_x = start_x
+
+    for pier in sorted_piers:
+        span_len = pier['x'] - prev_x
+        if span_len > 0.5:  # Minimum meaningful span
+            spans.append(round(float(span_len), 2))
+        prev_x = pier['x']
+
+    # Final span to end abutment
+    final_span = end_x - prev_x
+    if final_span > 0.5:
+        spans.append(round(float(final_span), 2))
+
+    return spans
 
 
 def main():
@@ -415,6 +716,10 @@ def main():
                         help="DBSCAN minimum points (default: 30)")
     parser.add_argument("--bridge-type", choices=["beam", "arch", "auto"], default="auto",
                         help="Bridge type hint (default: auto)")
+    parser.add_argument("--no-class-filter", action="store_true",
+                        help="Disable classification-based vegetation filtering")
+    parser.add_argument("--min-pier-height", type=float, default=1.5,
+                        help="Minimum height (m) for pier detection (default: 1.5)")
     args = parser.parse_args()
 
     # 1. Load
@@ -423,6 +728,17 @@ def main():
     # 2. Downsample
     pcd_down = downsample(pcd, voxel_size=args.voxel_size)
     all_points = np.asarray(pcd_down.points)
+
+    # 2.5 Vegetation pre-filtering (if LAS has classification)
+    veg_mask = None
+    if not args.no_class_filter:
+        print(f"\n[2.5/6] Classification-based vegetation filtering...")
+        pcd_down, veg_pcd, veg_mask_raw = filter_by_classification(
+            raw_points, args.input, pcd_down
+        )
+        if pcd_down is not None:
+            all_points = np.asarray(pcd_down.points)
+        print(f"  Points after veg filter: {len(all_points):,}")
 
     # 3. Multi-plane RANSAC
     planes, remaining_pcd = segment_multiple_planes(
@@ -447,18 +763,32 @@ def main():
                           'model': [0, 0, 1, -deck_z]}
             deck_info = compute_deck_from_plane(deck_plane)
 
-    # 4. Find piers in remaining points
+    # 3.5 Terrain profile extraction
+    print(f"\n[3.5/6] Extracting terrain profile...")
+    terrain_profile = extract_terrain_profile(ground_plane, deck_info)
+
+    # 4. Find piers in remaining points (with Z-based fallback)
     piers, abutments = find_piers_abutments(
         remaining_pcd, deck_z, ground_z,
         deck_info=deck_info,
-        eps=args.dbscan_eps, min_points=args.dbscan_min_points
+        eps=args.dbscan_eps, min_points=args.dbscan_min_points,
+        original_pcd=pcd  # Use original (pre-downsample) for fallback
     )
+
+    # 4.5 Multi-span computation
+    span_segments = compute_multi_span(piers, deck_info)
+    if span_segments and len(span_segments) > 1:
+        print(f"\n  Multi-span segments: {span_segments} ({len(span_segments)} spans)")
 
     # 5. Extract dimensions
     dimensions = extract_dimensions(deck_info, piers, ground_z, deck_z, all_points)
+    dimensions['span_segments'] = span_segments
+    dimensions['num_spans'] = len(span_segments) if span_segments else 1
 
-    # 6. Determine bridge type
-    bridge_type = determine_bridge_type(deck_info, piers, args.bridge_type)
+    # 6. Determine bridge type (with curvature analysis)
+    deck_pts = np.asarray(deck_plane['pcd'].points) if deck_plane else np.array([])
+    bridge_type = determine_bridge_type(deck_info, piers, args.bridge_type,
+                                         deck_points=deck_pts)
 
     # Build output parameters
     params = {
@@ -470,10 +800,15 @@ def main():
         "num_piers": len(piers),
         "pier_positions": piers,
         "abutment_positions": abutments,
+        "terrain_profile": terrain_profile,
+        "span_segments": span_segments,
         "processing_params": {
             "voxel_size": args.voxel_size,
             "ransac_threshold": args.ransac_threshold,
             "dbscan_eps": args.dbscan_eps,
+            "dbscan_min_points": args.dbscan_min_points,
+            "min_pier_height": args.min_pier_height,
+            "class_filter_enabled": not args.no_class_filter,
         },
     }
 
