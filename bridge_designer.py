@@ -99,14 +99,28 @@ def design_beam_bridge(dims, params, code):
         girder_type = "T-beam"
         girder_depth = span / 16
         num_girders = max(3, int(width / 2.5))
+        prestressed = False
     elif span < 35:
         girder_type = "I-beam"
         girder_depth = span / 18
         num_girders = max(3, int(width / 3.0))
+        prestressed = False
+    elif span <= 45:
+        # Prestressed I-girder — standard for 35-45m simple spans
+        return design_prestressed_bridge(dims, params, code)
+    elif span <= 80:
+        # Extended prestressed — may need continuous spans or deeper sections
+        print(f"\n  ⚠ {span}m span exceeds standard prestressed range (≤45m)")
+        print(f"     Attempting prestressed design, but consider:")
+        print(f"     - Continuous spans (reduce positive moment)")
+        print(f"     - Steel plate girders (lighter, longer spans)")
+        print(f"     - Segmental box girder (>60m)")
+        return design_prestressed_bridge(dims, params, code)
     else:
         girder_type = "Box Girder"
         girder_depth = span / 20
         num_girders = max(2, int(width / 4.0))
+        prestressed = False
 
     girder_depth = round(girder_depth, 2)
     girder_spacing = round(width / num_girders, 2)
@@ -389,6 +403,458 @@ def design_arch_bridge(dims, params, code):
             "compressive_stress_kPa": round(compressive_stress, 0),
             "allowable_stress_kPa": round(fc * 0.3, 0),
             "compression_ok": compressive_ok,
+        },
+    }
+
+
+# ============================================================================
+# Prestressed Concrete Bridge Design (50-80m spans)
+# AASHTO LRFD — Standard Prestressed I-Girders
+# ============================================================================
+
+# AASHTO Standard Prestressed Girder Sections (Type I–VI, BT)
+# Properties per girder: [depth_m, area_m2, Ix_m4, yb_m, yt_m, web_width_m, top_flange_w_m]
+AASHTO_SECTIONS = {
+    "Type I":   [0.711, 0.229, 0.0176, 0.321, 0.390, 0.152, 0.406],
+    "Type II":  [0.914, 0.303, 0.0395, 0.398, 0.516, 0.152, 0.457],
+    "Type III": [1.143, 0.381, 0.0814, 0.503, 0.640, 0.178, 0.559],
+    "Type IV":  [1.372, 0.479, 0.1487, 0.618, 0.754, 0.203, 0.660],
+    "Type V":   [1.600, 0.572, 0.2410, 0.707, 0.893, 0.203, 0.762],
+    "Type VI":  [1.829, 0.670, 0.3690, 0.809, 1.020, 0.203, 0.864],
+    "BT-54":    [1.372, 0.433, 0.1140, 0.660, 0.712, 0.152, 0.660],
+    "BT-63":    [1.600, 0.501, 0.1610, 0.770, 0.830, 0.152, 0.660],
+    "BT-72":    [1.829, 0.570, 0.2220, 0.882, 0.947, 0.152, 0.660],
+}
+
+# Low-relaxation 7-wire strand properties
+STRAND_1860 = {
+    "fpu_mpa": 1860.0,     # Ultimate tensile strength
+    "fpy_mpa": 1674.0,     # Yield strength (0.9*fpu)
+    "fpi_mpa": 1395.0,     # Initial stress (0.75*fpu)
+    "fpe_mpa": 1116.0,     # Effective stress after losses (~0.6*fpu est)
+    "ep_mpa": 540.0,       # Relaxation loss
+    "area_mm2": 98.7,      # 12.7mm diameter strand (Grade 1860)
+    "diameter_mm": 12.7,
+}
+
+
+def design_prestressed_bridge(dims, params, code):
+    """Design a prestressed concrete I-girder bridge for spans 35-80m.
+
+    Uses AASHTO standard girder sections with Grade 1860 (270 ksi) strands.
+    Performs service stress checks at transfer and final, ultimate moment check.
+    """
+    span = dims["span_length"]
+    width = dims["deck_width"]
+    clearance = dims.get("clearance_under_bridge", 5.0)
+    deck_elev = dims.get("deck_elevation", clearance)
+    piers_data = params.get("pier_positions", [])
+    abutments_data = params.get("abutment_positions", [])
+
+    print("\n[1/5] Superstructure Design — Prestressed Concrete")
+    print("-" * 40)
+
+    # ── Section Selection ──
+    girder_spacing = round(width / max(3, int(width / 3.0)), 2)
+    num_girders = max(3, int(width / 3.0))
+
+    # Select section: depth should be ~span/20 to span/25
+    # For spans > 50m, prefer BT (bulb-tee) sections
+    if span > 50:
+        candidates = {k: v for k, v in AASHTO_SECTIONS.items() if k.startswith("BT")}
+        if not candidates:
+            candidates = {k: v for k, v in AASHTO_SECTIONS.items() if "VI" in k}
+    elif span > 40:
+        candidates = {k: v for k, v in AASHTO_SECTIONS.items()
+                     if k.startswith("BT") or "V" in k or "VI" in k}
+    else:
+        candidates = AASHTO_SECTIONS
+
+    target_depth = span / 22
+    best_section = list(candidates.keys())[0]
+    best_depth = candidates[best_section][0]
+    for name, props in candidates.items():
+        if abs(props[0] - target_depth) < abs(best_depth - target_depth):
+            best_section = name
+            best_depth = props[0]
+
+    depth, area, Ix, yb, yt, web_w, tf_w = AASHTO_SECTIONS[best_section]
+    deck_thickness = 0.200  # 200mm deck slab
+    wearing_surface = 0.075
+    curb_w = 0.5
+    curb_h = 0.3
+
+    # Composite section (girder + deck)
+    # Deck effective width = min(girder_spacing, 12*deck_t + web_w, span/4)
+    deck_eff_w = min(girder_spacing, 12 * deck_thickness + web_w, span / 4)
+    composite_depth = depth + deck_thickness
+
+    print(f"  Section: AASHTO {best_section} (depth={depth}m, area={area:.3f}m², I={Ix:.4f}m⁴)")
+    print(f"  Girders: {num_girders} @ {girder_spacing}m spacing")
+    print(f"  Composite depth: {composite_depth:.2f}m (girder + {deck_thickness*1000:.0f}mm deck)")
+    print(f"  Span/depth ratio: {span/composite_depth:.1f}")
+
+    # ── Load Calculations ──
+    print("\n[2/5] Load Calculations — Prestressed Girder")
+    print("-" * 40)
+
+    concrete = CONCRETE_C40
+    rho_c = concrete["density_kg_m3"]
+    g = 9.81
+
+    # Girder self-weight
+    girder_w = area * rho_c * g / 1000  # kN/m per girder
+
+    # Deck + haunch
+    haunch_h = 0.025  # 25mm haunch
+    deck_w = deck_eff_w * deck_thickness * rho_c * g / 1000
+    haunch_w = web_w * haunch_h * rho_c * g / 1000
+
+    # Superimposed dead (spread across all girders)
+    asphalt_w = width * wearing_surface * 2300 * g / 1000 / num_girders
+    barrier_w = 2 * 5.0 / num_girders  # 5 kN/m each side
+    curb_w_girder = 2 * curb_w * curb_h * rho_c * g / 1000 / num_girders
+
+    w_girder = girder_w
+    w_deck = deck_w + haunch_w
+    w_super = asphalt_w + barrier_w + curb_w_girder
+    w_total = w_girder + w_deck + w_super
+
+    # Live load (AASHTO HL-93)
+    design_lanes = max(1, int(width / 3.6))
+    impact = min(0.33, 1.2 - 0.005 * span)
+    dist_factor = 1.2 / num_girders  # Simplified moment distribution
+
+    lane_load = 9.3  # kN/m
+    truck_load = 325  # kN
+    M_lane = lane_load * span ** 2 / 8
+    M_truck = truck_load * span / 4
+    M_ll = (M_lane + M_truck) * design_lanes * (1 + impact) * dist_factor
+
+    # Moments at midspan
+    M_girder = w_girder * span ** 2 / 8
+    M_deck = w_deck * span ** 2 / 8
+    M_super = w_super * span ** 2 / 8
+
+    print(f"  Girder self-weight: {w_girder:.1f} kN/m")
+    print(f"  Deck + haunch: {w_deck:.1f} kN/m")
+    print(f"  Superimposed dead: {w_super:.1f} kN/m")
+    print(f"  Live load moment: {M_ll:.0f} kN·m (per girder)")
+
+    # ── Strand Design ──
+    print("\n[3/5] Strand Pattern Design")
+    print("-" * 40)
+
+    strand = STRAND_1860
+    fpu = strand["fpu_mpa"]
+    fpi = strand["fpi_mpa"]  # Initial jacking stress
+    fpe_est = 0.60 * fpu     # Estimated effective stress after losses
+    Aps_strand = strand["area_mm2"]  # mm² per strand
+
+    # Eccentricity: place strands as low as possible for max eccentricity
+    # Harped strands: straight strands near bottom, some harped to top at ends
+    cover_bottom = 0.06  # 60mm bottom cover
+    e_max = yb - cover_bottom  # Max eccentricity at midspan (from centroid)
+    e_end = 0.0  # Centroidal at ends (simple span, stresses controlled at midspan)
+
+    # Required prestress force: Pe = M_total / (e + kt) where kt = rb^2 / yt
+    r2 = Ix / area  # Radius of gyration squared
+    kt = r2 / yt
+    kb = r2 / yb
+
+    # Service III moment (AASHTO — 0.8 live load for tension check)
+    M_service_III = M_girder + M_deck + M_super + 0.8 * M_ll
+    M_strength_I = 1.25 * (M_girder + M_deck) + 1.5 * M_super + 1.75 * M_ll
+
+    # Required effective prestress force
+    # Bottom fiber tension check: fb = -Pe/A - Pe*e/Sb + M/Sb >= -0.5*sqrt(f'c)
+    ft_allow_tension = 0.5 * math.sqrt(concrete["fc_mpa"]) * 1000  # kPa → Pa, then /1e6 for MPa
+    Sb = Ix / yb  # Section modulus bottom
+    St = Ix / yt  # Section modulus top
+
+    # For no tension at bottom: Pe >= M/e * A*Sb/(A*e + Sb) ... simplified
+    # Use bottom fiber stress equation to solve for Pe
+    # -Pe/A - Pe*e/Sb + M_total/Sb = 0 (zero tension)
+    if e_max > 0:
+        Pe_req = M_service_III / (e_max + Sb / area)  # kN·m → converted
+        # Convert to consistent units: Pe in kN, M in kN·m, e in m, A in m², S in m³
+        Pe_req_kN = M_service_III * 1000 / (e_max * 1000 + Sb * 1e9 / (area * 1e6)) / 1000  # simplified
+        # Actually let me recalculate properly
+        # fb = -Pe/A - Pe*e/Sb + M/Sb
+        # 0 = -Pe/A - Pe*e/Sb + M/Sb
+        # Pe * (1/A + e/Sb) = M/Sb
+        # Pe = (M/Sb) / (1/A + e/Sb) = M / (Sb/A + e)
+        Pe_req_kN = M_service_III / (Sb / area + e_max)
+    else:
+        Pe_req_kN = M_service_III * area / Sb  # Centroidal prestress
+
+    # Number of strands required
+    Aps_req_mm2 = Pe_req_kN * 1000 / fpe_est  # mm²
+    n_strands = max(4, math.ceil(Aps_req_mm2 / Aps_strand))
+    n_strands = (n_strands + 1) // 2 * 2  # Round to even
+
+    # Check against section capacity (max strands in bottom flange)
+    bottom_flange_area_mm2 = web_w * 0.5 * depth * 1e6  # Approx half the web-bulb area
+    max_strands = int(bottom_flange_area_mm2 / (strand["diameter_mm"] * 2)**2)
+    max_strands = max(20, min(max_strands, 80))  # Practical range: 20-80
+    if n_strands > max_strands:
+        print(f"  ⚠ Strand count {n_strands} exceeds practical limit ({max_strands})")
+        print(f"     → Using {max_strands} strands. Consider deeper section or shorter span.")
+        n_strands = max_strands
+
+    Pe_provided_kN = n_strands * Aps_strand * fpe_est / 1000  # kN
+
+    # Strand layout: harp some strands for shear control
+    n_harped = max(2, n_strands // 4)  # 25% harped
+    n_straight = n_strands - n_harped
+
+    print(f"  Required Pe: {Pe_req_kN:.0f} kN → Provided: {Pe_provided_kN:.0f} kN")
+    print(f"  Strands: {n_strands} total ({n_straight} straight + {n_harped} harped)")
+    print(f"  Strand diameter: {strand['diameter_mm']}mm Grade 1860")
+    print(f"  Max eccentricity at midspan: {e_max*1000:.0f}mm")
+
+    # ── Prestress Losses ──
+    print("\n[4/5] Prestress Losses")
+    print("-" * 40)
+
+    # Initial stress
+    fpi_actual = fpi
+    P_i = n_strands * Aps_strand * fpi_actual / 1000  # kN initial jacking force
+
+    # 1. Elastic shortening (ES) — AASHTO LRFD 5.9.5.2.3a
+    Ep = 196500  # MPa (strand elastic modulus)
+    Eci = concrete["ec_gpa"] * 1000  # MPa (concrete modulus at transfer)
+    # Stress in concrete at strand CG from initial prestress + self-weight
+    f_cgp_mpa = (P_i / (area * 1e6) * 1e3
+                 + P_i * e_max**2 / (Ix * 1e6) * 1e3
+                 - M_girder * e_max / (Ix * 1e6) * 1e3)
+    loss_es = Ep / Eci * f_cgp_mpa  # MPa
+    loss_es = min(loss_es, 0.05 * fpi_actual)  # Cap at 5% — low-relaxation strands
+    loss_es_pct = loss_es / fpi_actual * 100
+
+    # 2. Creep of concrete (CR) — AASHTO LRFD 5.9.5.3
+    M_sd = M_deck + M_super
+    f_cds_mpa = M_sd * e_max / (Ix * 1e6) * 1e3
+    # AASHTO simplified: CR = 12*f_cgp - 7*f_cds (min 0)
+    loss_cr = max(0, 12 * f_cgp_mpa - 7 * f_cds_mpa)
+    loss_cr = min(loss_cr, 0.15 * fpi_actual)  # Cap at 15%
+    loss_cr_pct = loss_cr / fpi_actual * 100
+
+    # 3. Shrinkage (SH) — AASHTO LRFD 5.9.5.4.2
+    H = 70  # Relative humidity %
+    loss_sh = max(0, 117 - 1.03 * H)  # MPa for accelerated curing
+    loss_sh_pct = loss_sh / fpi_actual * 100
+
+    # 4. Relaxation (RE) — AASHTO LRFD 5.9.5.4.4c
+    # For low-relaxation strands: RE = 5.0 - 0.15*(SH+CR+ES) MPa (in ksi units, converted)
+    # Simplified: ~5% of fpi for low-relaxation
+    loss_re = 5.0 * 6.895  # 5 ksi ≈ 34.5 MPa (AASHTO base relaxation)
+    # Add reduction for low-relaxation: subtract 0.15*(SH+CR+ES)
+    loss_re_adjusted = max(0, loss_re - 0.15 * (loss_sh + loss_cr + loss_es))
+    loss_re = min(loss_re_adjusted, 0.05 * fpi_actual)  # Cap: 5% of initial stress
+    loss_re_pct = loss_re / fpi_actual * 100
+
+    total_loss = loss_es + loss_cr + loss_sh + loss_re
+    total_loss_pct = total_loss / fpi_actual * 100
+    fpe_actual = fpi_actual - total_loss
+
+    # Effective stress floor: 55% of fpu (typical for low-relaxation)
+    fpe_min = 0.55 * fpu
+    if fpe_actual < fpe_min:
+        fpe_actual = fpe_min
+        total_loss_pct = (fpi_actual - fpe_actual) / fpi_actual * 100
+
+    Pe_final_kN = n_strands * Aps_strand * fpe_actual / 1000
+
+    print(f"  Elastic shortening: {loss_es:.0f} MPa ({loss_es_pct:.1f}%)")
+    print(f"  Creep: {loss_cr:.0f} MPa ({loss_cr_pct:.1f}%)")
+    print(f"  Shrinkage: {loss_sh:.0f} MPa ({loss_sh_pct:.1f}%)")
+    print(f"  Relaxation: {loss_re:.0f} MPa ({loss_re_pct:.1f}%)")
+    print(f"  Total loss: {total_loss:.0f} MPa ({total_loss_pct:.1f}%)")
+    print(f"  Final effective prestress: {fpe_actual:.0f} MPa")
+
+    # ── Stress Checks ──
+    print("\n[5/5] Service Stress Checks")
+    print("-" * 40)
+
+    fc_mpa = concrete["fc_mpa"]
+    fci_mpa = fc_mpa * 0.75  # Transfer strength (75% of f'c)
+
+    # Transfer stresses (girder self-weight only, initial prestress)
+    # Top fiber: ft = -Pi/A + Pi*e/St - Mg/St
+    ft_transfer_mpa = (-P_i / area / 1e6 * 1e3
+                       + P_i * e_max / St / 1e6 * 1e3
+                       - M_girder / St / 1e6 * 1e3)
+
+    # Bottom fiber: fb = -Pi/A - Pi*e/Sb + Mg/Sb
+    fb_transfer_mpa = (-P_i / area / 1e6 * 1e3
+                       - P_i * e_max / Sb / 1e6 * 1e3
+                       + M_girder / Sb / 1e6 * 1e3)
+
+    # Allowable stresses at transfer
+    ft_allow_transfer = 0.25 * math.sqrt(fci_mpa)  # Tension
+    fc_allow_transfer = 0.60 * fci_mpa  # Compression
+
+    transfer_top_ok = ft_transfer_mpa <= ft_allow_transfer
+    transfer_bot_ok = abs(fb_transfer_mpa) <= fc_allow_transfer
+
+    print(f"  Transfer (f'ci={fci_mpa:.0f} MPa):")
+    print(f"    Top:    {ft_transfer_mpa:.1f} MPa (allow +{ft_allow_transfer:.1f} tension) {'OK' if transfer_top_ok else 'FAIL'}")
+    print(f"    Bottom: {fb_transfer_mpa:.1f} MPa (allow -{fc_allow_transfer:.0f} comp) {'OK' if transfer_bot_ok else 'FAIL'}")
+
+    # Service stresses (full load, effective prestress)
+    M_total_service = M_girder + M_deck + M_super + M_ll
+
+    ft_service_mpa = (-Pe_final_kN / area / 1e6 * 1e3
+                      + Pe_final_kN * e_max / St / 1e6 * 1e3
+                      - M_total_service / St / 1e6 * 1e3)
+
+    fb_service_mpa = (-Pe_final_kN / area / 1e6 * 1e3
+                      - Pe_final_kN * e_max / Sb / 1e6 * 1e3
+                      + M_total_service / Sb / 1e6 * 1e3)
+
+    # Allowable at service (after all losses)
+    ft_allow_service = 0.5 * math.sqrt(fc_mpa)  # Tension (MPa)  - Service III
+    fc_allow_service = 0.45 * fc_mpa  # Compression (Service I)
+    fc_allow_service_iii = 0.60 * fc_mpa  # Service III compression (less critical)
+
+    service_top_ok = ft_service_mpa <= ft_allow_service
+    service_bot_ok = fb_service_mpa <= ft_allow_service  # Tension check bottom
+
+    print(f"  Service (f'c={fc_mpa:.0f} MPa):")
+    print(f"    Top:    {ft_service_mpa:.1f} MPa (allow +{ft_allow_service:.1f} tension) {'OK' if service_top_ok else 'CHECK'}")
+    print(f"    Bottom: {fb_service_mpa:.1f} MPa (allow +{ft_allow_service:.1f} tension) {'OK' if service_bot_ok else 'CHECK'}")
+
+    # ── Ultimate Moment Capacity (AASHTO LRFD 5.7.3) ──
+    # Effective depth to strand centroid (from top of composite section)
+    dp = composite_depth - (cover_bottom + 0.05)  # m, strands ~50mm from bottom
+    dp_mm = dp * 1000  # mm
+
+    # Total prestressing steel area
+    Aps_total = n_strands * Aps_strand  # mm²
+
+    # Stress in prestressing steel at nominal flexural resistance
+    # AASHTO LRFD Eq. 5.7.3.1.1-1: fps = fpu * (1 - k * c/dp)
+    # For rectangular section with compression in deck:
+    # k = 2 * (1.04 - fpy/fpu) = 2 * (1.04 - 0.9) = 0.28 for low-relaxation
+    k = 0.28
+    # Assume neutral axis in deck (typical for composite sections)
+    # c = Aps*fpu / (0.85*fc*b*β1 + k*Aps*fpu/dp)
+    deck_eff_width_mm = deck_eff_w * 1000  # Effective deck width
+    beta1 = 0.85 if fc_mpa <= 28 else max(0.65, 0.85 - (fc_mpa - 28) / 7 * 0.05)
+    c = (Aps_total * fpu) / (0.85 * fc_mpa * deck_eff_width_mm * beta1
+                              + k * Aps_total * fpu / dp_mm)
+    fps = fpu * (1 - k * c / dp_mm)
+    fps = min(fps, fpu)  # Cannot exceed fpu
+
+    # Compression block depth
+    a = Aps_total * fps / (0.85 * fc_mpa * deck_eff_width_mm)  # mm
+    # Ensure a <= deck thickness (neutral axis in deck)
+    if a > deck_thickness * 1000:
+        # Neutral axis in girder — recalc with web width
+        a = Aps_total * fps / (0.85 * fc_mpa * web_w * 1000)  # mm
+
+    # Nominal moment capacity
+    Mn = Aps_total * fps * (dp_mm - a / 2) / 1e6  # kN·m
+    # Resistance factor for prestressed concrete in flexure: φ = 1.0 (tension-controlled)
+    phi_Mn = 1.0 * Mn
+
+    capacity_ok = phi_Mn >= M_strength_I
+    ratio = phi_Mn / M_strength_I if M_strength_I > 0 else 0
+    status = "OK" if capacity_ok else f"NG ({ratio:.2f}x — consider deeper section or shorter span)"
+
+    print(f"\n  Ultimate: φMn={phi_Mn:.0f} kN·m vs Mu={M_strength_I:.0f} kN·m → {status}")
+
+    # ── Camber Estimate ──
+    Ec = concrete["ec_gpa"] * 1e6  # kPa
+    # Upward camber from prestress: δp = Pe*e*L²/(8*E*I)
+    camber_prestress = Pe_final_kN * e_max * span**2 / (8 * Ec * Ix) * 1000  # mm
+    # Downward deflection from girder self-weight
+    camber_self_wt = 5 * w_girder * span**4 / (384 * Ec * Ix) * 1000  # mm
+    camber_net = camber_prestress - camber_self_wt
+
+    print(f"  Camber: prestress ↑{camber_prestress:.1f}mm - self_wt ↓{camber_self_wt:.1f}mm = net ↑{camber_net:.1f}mm")
+
+    # ── Bill of Materials ──
+    girder_concrete = area * span * num_girders
+    deck_concrete = span * width * deck_thickness
+    total_concrete = girder_concrete + deck_concrete
+
+    strand_length = span * 1.05  # +5% for jacking
+    strand_mass = n_strands * strand_length * strand["area_mm2"] * 7850 / 1e6  # kg
+    mild_rebar_kg = total_concrete * 40  # ~40 kg/m³ for mild steel in prestressed
+
+    print(f"\n  Concrete: {total_concrete:.1f} m³ (girder: {girder_concrete:.1f}, deck: {deck_concrete:.1f})")
+    print(f"  Strands: {strand_mass:.0f} kg ({n_strands} × {strand['diameter_mm']}mm × {span:.1f}m)")
+    print(f"  Mild rebar: {mild_rebar_kg:.0f} kg")
+
+    # ── Build output ──
+    return {
+        "bridge_type": "prestressed_beam",
+        "design_code": "",
+        "superstructure": {
+            "girder_type": f"AASHTO {best_section}",
+            "num_girders": num_girders,
+            "girder_depth": depth,
+            "girder_spacing": girder_spacing,
+            "girder_area_m2": round(area, 3),
+            "girder_Ix_m4": round(Ix, 4),
+            "deck_thickness": deck_thickness,
+            "wearing_surface": wearing_surface,
+            "composite_depth": round(composite_depth, 2),
+            "curb_width": curb_w,
+            "curb_height": curb_h,
+        },
+        "prestressing": {
+            "strand_diameter_mm": strand["diameter_mm"],
+            "strand_grade": "1860 MPa (270 ksi) low-relaxation",
+            "n_strands": n_strands,
+            "n_straight": n_straight,
+            "n_harped": n_harped,
+            "jack_stress_mpa": fpi_actual,
+            "effective_stress_mpa": round(fpe_actual, 0),
+            "eccentricity_midspan_mm": round(e_max * 1000, 0),
+            "total_loss_pct": round(total_loss_pct, 1),
+            "loss_breakdown": {
+                "elastic_shortening_mpa": round(loss_es, 0),
+                "creep_mpa": round(loss_cr, 0),
+                "shrinkage_mpa": round(loss_sh, 0),
+                "relaxation_mpa": round(loss_re, 0),
+            },
+        },
+        "substructure": design_substructure(piers_data, abutments_data, width,
+                                              clearance, depth, deck_thickness),
+        "reinforcement": {
+            "prestressing_strands": f"{n_strands}-Φ{strand['diameter_mm']}mm Grade 1860",
+            "mild_rebar": "per AASHTO LRFD Art. 5.10",
+            "shear_reinf": "Φ12@150 (typical web)",
+        },
+        "quantities": {
+            "concrete_m3": {
+                "prestressed_girders": round(girder_concrete, 1),
+                "deck_slab": round(deck_concrete, 1),
+            },
+            "prestressing_steel_kg": round(strand_mass, 0),
+            "mild_rebar_kg": round(mild_rebar_kg, 0),
+            "total_concrete_m3": round(total_concrete, 1),
+            "total_rebar_kg": round(strand_mass + mild_rebar_kg, 0),
+            "formwork_m2": round(span * width * 1.2 + span * depth * 2 * num_girders * 0.6, 0),
+            "bearings_count": max(4, num_girders * 2),
+            "expansion_joints_m": round(width + 0.5, 1),
+        },
+        "loads": {
+            "girder_self_wt_kN_per_m": round(w_girder, 1),
+            "total_dead_kN_per_m": round(w_total, 1),
+            "live_load_moment_kNm": round(M_ll, 0),
+        },
+        "analysis": {
+            "stress_check_transfer": "OK" if (transfer_top_ok and transfer_bot_ok) else "CHECK",
+            "stress_check_service": "OK" if (service_top_ok and service_bot_ok) else "CHECK",
+            "ultimate_capacity_kNm": round(phi_Mn, 0),
+            "ultimate_demand_kNm": round(M_strength_I, 0),
+            "capacity_ok": capacity_ok,
+            "camber_net_mm": round(camber_net, 1),
+            "total_loss_pct": round(total_loss_pct, 1),
         },
     }
 
