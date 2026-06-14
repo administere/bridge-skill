@@ -37,6 +37,15 @@ STEEL_GRADE_500 = {
     "density_kg_m3": 7850.0,
 }
 
+# Structural steel (ASTM A709 Grade 50 / Q345q)
+STRUCTURAL_STEEL = {
+    "fy_mpa": 345.0,       # Yield strength
+    "fu_mpa": 450.0,       # Ultimate strength
+    "es_gpa": 200.0,       # Elastic modulus
+    "density_kg_m3": 7850.0,
+    "poisson": 0.3,
+}
+
 # Standard rebar diameters and areas (mm)
 REBAR_SIZES = {
     10: {"area_mm2": 78.5, "mass_kg_per_m": 0.617},
@@ -94,33 +103,28 @@ def design_beam_bridge(dims, params, code):
     print("\n[1/6] Superstructure Design — Beam Bridge")
     print("-" * 40)
 
-    # ── Girder Selection ──
+    # ── Girder Selection (auto-routing by span) ──
     if span < 15:
+        # Short spans: reinforced concrete T-beam
         girder_type = "T-beam"
         girder_depth = span / 16
         num_girders = max(3, int(width / 2.5))
-        prestressed = False
     elif span < 35:
+        # Medium spans: reinforced concrete I-beam
         girder_type = "I-beam"
         girder_depth = span / 18
         num_girders = max(3, int(width / 3.0))
-        prestressed = False
     elif span <= 45:
-        # Prestressed I-girder — standard for 35-45m simple spans
+        # Long spans: prestressed concrete I-girder (AASHTO standard)
         return design_prestressed_bridge(dims, params, code)
-    elif span <= 80:
-        # Extended prestressed — may need continuous spans or deeper sections
-        print(f"\n  ⚠ {span}m span exceeds standard prestressed range (≤45m)")
-        print(f"     Attempting prestressed design, but consider:")
-        print(f"     - Continuous spans (reduce positive moment)")
-        print(f"     - Steel plate girders (lighter, longer spans)")
-        print(f"     - Segmental box girder (>60m)")
-        return design_prestressed_bridge(dims, params, code)
+    elif span <= 150:
+        # Extended spans: steel plate girder
+        return design_steel_girder_bridge(dims, params, code)
     else:
-        girder_type = "Box Girder"
-        girder_depth = span / 20
-        num_girders = max(2, int(width / 4.0))
-        prestressed = False
+        print(f"\n  ⚠ {span}m exceeds practical simple-span range (>150m)")
+        print(f"     Consider: cable-stayed, arch, or suspension bridge")
+        print(f"     Attempting steel girder as lower bound...")
+        return design_steel_girder_bridge(dims, params, code)
 
     girder_depth = round(girder_depth, 2)
     girder_spacing = round(width / num_girders, 2)
@@ -855,6 +859,285 @@ def design_prestressed_bridge(dims, params, code):
             "capacity_ok": capacity_ok,
             "camber_net_mm": round(camber_net, 1),
             "total_loss_pct": round(total_loss_pct, 1),
+        },
+    }
+
+
+# ============================================================================
+# Steel Plate Girder Bridge Design (50-150m spans)
+# AASHTO LRFD — Steel I-Girder with composite concrete deck
+# ============================================================================
+
+def design_steel_girder_bridge(dims, params, code):
+    """Design a steel plate girder bridge for spans 45-150m.
+
+    Steel I-girder with composite reinforced concrete deck.
+    Design checks: bending (compact/noncompact), shear, web buckling,
+    fatigue category, deflection.
+    """
+    span = dims["span_length"]
+    width = dims["deck_width"]
+    clearance = dims.get("clearance_under_bridge", 5.0)
+    deck_elev = dims.get("deck_elevation", clearance)
+    piers_data = params.get("pier_positions", [])
+    abutments_data = params.get("abutment_positions", [])
+
+    steel = STRUCTURAL_STEEL
+    concrete = CONCRETE_C40
+
+    print("\n[1/5] Superstructure Design — Steel Plate Girder")
+    print("-" * 40)
+
+    # ── Girder Proportions ──
+    # Web depth: L/22 (short) to L/17 (long) for plate girders
+    if span < 50:
+        web_depth = span / 22
+    elif span < 80:
+        web_depth = span / 19
+    elif span < 120:
+        web_depth = span / 18
+    else:
+        web_depth = span / 17  # Very deep for longest spans
+    web_depth = round(web_depth, 2)
+
+    # Number of girders
+    num_girders = max(2, int(width / 3.5))
+    girder_spacing = round(width / num_girders, 2)
+
+    # Deck slab
+    deck_thickness = 0.200 if span < 80 else 0.225
+    wearing_surface = 0.075
+    curb_w = 0.5
+    curb_h = 0.3
+
+    # Web plate
+    web_t = max(0.012, web_depth / 150)
+    web_t = round(web_t * 1000, 0)
+    web_t = max(12, min(web_t, 25))
+    web_t_m = web_t / 1000
+
+    # Flange plates (compact section: bf/2tf <= 0.38*sqrt(E/Fy))
+    flange_limit = 0.38 * math.sqrt(steel["es_gpa"] * 1000 / steel["fy_mpa"])
+    flange_w = max(0.35, web_depth / 5)
+    flange_w = round(flange_w, 2)
+    flange_t_raw = flange_w / (2 * flange_limit)
+    flange_t = max(0.020, round(flange_t_raw * 1000, 0) / 1000)
+    flange_t = max(20, min(flange_t * 1000, 80)) / 1000
+
+    total_depth = web_depth + 2 * flange_t
+    composite_depth = total_depth + deck_thickness
+
+    print(f"  Span: {span}m -> Steel plate girder ({num_girders} girders @ {girder_spacing}m)")
+    print(f"  Web: {web_depth*1000:.0f}mm x {web_t:.0f}mm")
+    print(f"  Flanges: {flange_w*1000:.0f}mm x {flange_t*1000:.0f}mm")
+    print(f"  Total steel depth: {total_depth*1000:.0f}mm")
+    print(f"  Span/depth: {span/total_depth:.1f}")
+    print(f"  Deck: {deck_thickness*1000:.0f}mm RC slab (composite)")
+
+    # ── Section Properties ──
+    flange_area = flange_w * flange_t
+    web_area = web_depth * web_t_m
+    steel_area = 2 * flange_area + web_area
+
+    I_steel = 2 * flange_area * (web_depth / 2 + flange_t / 2)**2 + \
+              web_t_m * web_depth**3 / 12
+    S_steel_bot = I_steel / (total_depth / 2)
+
+    # Composite section
+    n_modular = steel["es_gpa"] / (0.043 * math.sqrt(concrete["density_kg_m3"])
+                                     * math.sqrt(concrete["fc_mpa"]))
+    n_modular = max(6, round(n_modular, 0))
+    deck_eff_w = min(girder_spacing, span / 4, 12 * deck_thickness + flange_w)
+    deck_transformed = deck_eff_w * deck_thickness / n_modular
+    deck_centroid = total_depth + deck_thickness / 2
+
+    y_composite = (steel_area * total_depth / 2 + deck_transformed * deck_centroid) / \
+                  (steel_area + deck_transformed)
+    I_composite = I_steel + steel_area * (y_composite - total_depth / 2)**2 + \
+                  deck_transformed * deck_thickness**2 / 12 + \
+                  deck_transformed * (deck_centroid - y_composite)**2
+    S_comp_bot = I_composite / y_composite
+    S_comp_top = I_composite / (composite_depth - y_composite)
+
+    print(f"\n  Steel area: {steel_area*1e6:.0f} mm2")
+    print(f"  I_steel: {I_steel*1e12:.0f} mm4")
+    print(f"  Composite I: {I_composite*1e12:.0f} mm4 (n={n_modular:.0f})")
+
+    # ── Load Calculations ──
+    print("\n[2/5] Load Calculations — Steel Girder")
+    print("-" * 40)
+
+    rho_s = steel["density_kg_m3"]
+    rho_c = concrete["density_kg_m3"]
+    g = 9.81
+
+    w_steel = steel_area * rho_s * g / 1000
+    w_deck = girder_spacing * deck_thickness * rho_c * g / 1000
+    w_asphalt = girder_spacing * wearing_surface * 2300 * g / 1000
+    w_barrier = 2 * 5.0 / num_girders
+    w_curb = 2 * curb_w * curb_h * rho_c * g / 1000 / num_girders
+    w_total_dl = w_steel + w_deck + w_asphalt + w_barrier + w_curb
+
+    design_lanes = max(1, int(width / 3.6))
+    impact = min(0.33, 1.2 - 0.005 * span)
+    dist_factor = 1.2 / num_girders
+    lane_load = 9.3
+    M_lane = lane_load * span**2 / 8
+    M_truck = 325 * span / 4
+    M_ll = (M_lane + M_truck) * design_lanes * (1 + impact) * dist_factor
+    V_ll = (lane_load * span / 2 + 325) * design_lanes * (1 + impact) * dist_factor
+
+    M_dc = (w_steel + w_deck) * span**2 / 8
+    M_dw = (w_asphalt + w_barrier + w_curb) * span**2 / 8
+
+    print(f"  Steel self-wt: {w_steel:.1f} kN/m")
+    print(f"  Total DL: {w_total_dl:.1f} kN/m")
+    print(f"  Live load M: {M_ll:.0f} kN-m (per girder)")
+
+    # ── Strength Checks ──
+    print("\n[3/5] Strength Checks")
+    print("-" * 40)
+
+    fy_mpa = steel["fy_mpa"]  # 345 MPa
+
+    M_u = 1.25 * M_dc + 1.50 * M_dw + 1.75 * M_ll
+    V_u = 1.25 * (w_steel + w_deck) * span / 2 + \
+          1.50 * (w_asphalt + w_barrier + w_curb) * span / 2 + 1.75 * V_ll
+
+    # Flexural resistance: Mn = Fy * S (MPa * m³ = MN·m = 1000 kN·m)
+    Mn_composite = fy_mpa * S_comp_bot  # MPa * m³ → then /1000 for kN·m? Let's check:
+    # fy_mpa (MPa) = MN/m², S_comp_bot (m³), so fy * S = MN·m = 1000 kN·m
+    Mn_composite_kNm = Mn_composite * 1000  # MN·m → kN·m
+    phi_Mn = 1.0 * Mn_composite_kNm
+
+    # Web shear (AASHTO LRFD 6.10.9) — iterate stiffener spacing
+    fy_mpa = steel["fy_mpa"]
+    E_mpa = steel["es_gpa"] * 1000
+    Aw = web_depth * web_t_m * 1e6  # mm²
+    D = web_depth * 1000  # mm
+    D_tw = D / web_t
+
+    # Try unstiffened first, then add stiffeners if needed
+    V_u_req = 1.25 * (w_steel + w_deck) * span / 2 + \
+              1.50 * (w_asphalt + w_barrier + w_curb) * span / 2 + 1.75 * V_ll
+
+    stiffener_spacing_m = None
+    for d0_D in [None, 3.0, 2.0, 1.5, 1.0, 0.8]:  # None=unstiffened, then stiffened ratios
+        if d0_D is None:
+            kv = 5.0  # Unstiffened
+        else:
+            kv = 5.0 + 5.0 / (d0_D)**2  # Stiffened panel (AASHTO 6.10.9.3.2)
+
+        limit_1 = 1.12 * math.sqrt(kv * E_mpa / fy_mpa)
+        limit_2 = 1.40 * math.sqrt(kv * E_mpa / fy_mpa)
+
+        if D_tw <= limit_1:
+            Cv = 1.0
+        elif D_tw <= limit_2:
+            Cv = limit_1 / D_tw
+        else:
+            Cv = 1.51 * E_mpa * kv / (fy_mpa * D_tw**2)
+
+        Vn = 0.58 * fy_mpa * Aw * Cv / 1000  # kN
+        if Vn >= V_u_req:
+            if d0_D is not None:
+                stiffener_spacing_m = round(d0_D * web_depth, 1)
+            break
+
+    phi_Vn = 1.0 * Vn
+
+    flexure_ok = phi_Mn >= M_u
+    shear_ok = phi_Vn >= V_u
+
+    print(f"  Flexure: phiMn={phi_Mn:.0f} kN-m vs Mu={M_u:.0f} kN-m -> "
+          f"{'OK' if flexure_ok else 'NG (' + str(round(phi_Mn/M_u, 2)) + 'x)'}")
+    print(f"  Shear: phiVn={phi_Vn:.0f} kN vs Vu={V_u:.0f} kN -> {'OK' if shear_ok else 'NG'}")
+    print(f"  Web slenderness D/tw={D_tw:.0f} (Cv={Cv:.2f})")
+
+    # ── Deflection ──
+    print("\n[4/5] Serviceability")
+    print("-" * 40)
+
+    E = steel["es_gpa"] * 1e6  # kPa
+    delta_ll = 5 * (lane_load * design_lanes * dist_factor) * span**4 / \
+               (384 * E * I_composite) * 1000  # mm
+    delta_limit = span * 1000 / 800
+    deflection_ok = delta_ll <= delta_limit
+
+    stiffeners_needed = stiffener_spacing_m is not None
+    stiffener_report = f"@ {stiffener_spacing_m}m (d0/D={stiffener_spacing_m/web_depth:.1f})" \
+                       if stiffeners_needed else "not required"
+
+    print(f"  Live load deflection: {delta_ll:.1f}mm (limit: L/800 = {delta_limit:.1f}mm) -> "
+          f"{'OK' if deflection_ok else 'CHECK'}")
+    print(f"  Stiffeners: {stiffener_report}")
+
+    # ── Bill of Materials ──
+    print("\n[5/5] Bill of Materials")
+    print("-" * 40)
+
+    steel_mass = steel_area * span * num_girders * rho_s / 1000
+    steel_mass_total = steel_mass * 1.10
+    deck_concrete = span * width * deck_thickness
+
+    print(f"  Steel: {steel_mass_total:.1f} tonnes ({num_girders} girders, +10% stiffeners/splices)")
+    print(f"  Concrete deck: {deck_concrete:.1f} m3")
+    print(f"  Cross-frames: {max(2, int(span/8))} diaphragms")
+
+    return {
+        "bridge_type": "steel_girder",
+        "design_code": "",
+        "superstructure": {
+            "girder_type": "Steel Plate I-Girder (ASTM A709 Gr.50)",
+            "num_girders": num_girders,
+            "girder_spacing": girder_spacing,
+            "web_depth_m": web_depth,
+            "web_thickness_mm": web_t,
+            "flange_width_m": flange_w,
+            "flange_thickness_mm": round(flange_t * 1000, 0),
+            "total_steel_depth_m": round(total_depth, 2),
+            "composite_depth_m": round(composite_depth, 2),
+            "deck_thickness": deck_thickness,
+            "wearing_surface": wearing_surface,
+            "curb_width": curb_w,
+            "curb_height": curb_h,
+            "steel_area_m2": round(steel_area, 4),
+            "I_steel_m4": round(I_steel, 6),
+            "I_composite_m4": round(I_composite, 6),
+        },
+        "substructure": design_substructure(piers_data, abutments_data, width,
+                                              clearance, total_depth, deck_thickness,
+                                              abutment_type="steel_girder_seat"),
+        "reinforcement": {
+            "steel_grade": "ASTM A709 Gr.50 (fy=345 MPa)",
+            "girder_fabrication": "welded plate girder",
+            "web_stiffeners": stiffener_report,
+            "stiffener_spacing_m": stiffener_spacing_m,
+            "deck_rebar": "16mm @ 150mm top and bottom",
+            "shear_studs": "22mm dia @ 300mm (3 per row)",
+        },
+        "quantities": {
+            "structural_steel_tonnes": round(steel_mass_total, 1),
+            "concrete_m3": {"deck_slab": round(deck_concrete, 1)},
+            "rebar_kg": round(deck_concrete * 80, 0),
+            "bearings_count": num_girders * 2,
+            "expansion_joints_m": round(width + 0.5, 1),
+            "painting_area_m2": round(span * (2 * web_depth + 4 * flange_w) * num_girders, 0),
+        },
+        "loads": {
+            "steel_self_wt_kN_per_m": round(w_steel, 1),
+            "total_dead_kN_per_m": round(w_total_dl, 1),
+            "live_load_moment_kNm": round(M_ll, 0),
+        },
+        "analysis": {
+            "flexure_phi_Mn_kNm": round(phi_Mn, 0),
+            "factored_Mu_kNm": round(M_u, 0),
+            "flexure_ok": flexure_ok,
+            "shear_phi_Vn_kN": round(phi_Vn, 0),
+            "shear_ok": shear_ok,
+            "deflection_mm": round(delta_ll, 1),
+            "deflection_ok": deflection_ok,
+            "web_D_tw": round(D_tw, 0),
         },
     }
 
