@@ -714,7 +714,7 @@ def main():
                         help="DBSCAN epsilon for pier clustering (default: 0.5m)")
     parser.add_argument("--dbscan-min-points", type=int, default=30,
                         help="DBSCAN minimum points (default: 30)")
-    parser.add_argument("--bridge-type", choices=["beam", "arch", "auto"], default="auto",
+    parser.add_argument("--bridge-type", choices=["beam", "arch", "truss", "auto"], default="auto",
                         help="Bridge type hint (default: auto)")
     parser.add_argument("--no-class-filter", action="store_true",
                         help="Disable classification-based vegetation filtering")

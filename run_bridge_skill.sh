@@ -52,7 +52,7 @@ Options:
   --span N                 Bridge span in meters (default: 30)
   --width N                Deck width in meters (default: 8)
   --pier-height N          Pier height in meters (default: 5)
-  --bridge-type TYPE       beam | arch | auto (default: auto)
+  --bridge-type TYPE       beam | arch | truss | auto (default: auto)
   --design-code CODE       AASHTO | CHN (default: AASHTO)
   --live-load MODEL        HL93 | CL1 (default: HL93)
   --output-dir DIR         Output directory (default: ./bridge_output)

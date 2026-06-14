@@ -78,6 +78,8 @@ def design_bridge(params, design_code="AASHTO"):
 
     if bridge_type == "arch":
         design = design_arch_bridge(dims, params, design_code)
+    elif bridge_type == "truss":
+        design = design_steel_truss_bridge(dims, params, design_code)
     else:
         design = design_beam_bridge(dims, params, design_code)
 
@@ -863,6 +865,126 @@ def design_prestressed_bridge(dims, params, code):
             "capacity_ok": capacity_ok,
             "camber_net_mm": round(camber_net, 1),
             "total_loss_pct": round(total_loss_pct, 1),
+        },
+    }
+
+
+# ============================================================================
+# ============================================================================
+# Steel Truss Bridge Design (40-150m spans)
+# Pratt/Warren truss with composite concrete deck
+# ============================================================================
+
+def design_steel_truss_bridge(dims, params, code):
+    """Design a steel truss bridge for spans 40-150m.
+
+    Uses Pratt truss configuration (verticals in compression, diagonals in tension).
+    """
+
+    span = dims["span_length"]
+    width = dims["deck_width"]
+    clearance = dims.get("clearance_under_bridge", 5.0)
+
+    print("\n[1/5] Superstructure Design — Steel Truss")
+    print("-" * 40)
+
+    # Truss geometry
+    truss_height = span / 8  # Economical depth for truss
+    n_panels = max(6, int(span / 6))  # 6m panel spacing
+    panel_length = span / n_panels
+
+    # Member sizing
+    # Top chord (compression)
+    top_chord_section = f"H-{max(200, int(truss_height*1000/15))}x{max(200, int(truss_height*1000/15))}"
+    # Bottom chord (tension)
+    bot_chord_section = f"W-{max(200, int(truss_height*1000/20))}x{max(150, int(truss_height*1000/25))}"
+    # Diagonals
+    diagonal_section = f"2L-{max(100, int(truss_height*1000/25))}x{max(100, int(truss_height*1000/25))}x10"
+
+    # Deck
+    deck_thickness = 0.200
+    deck_w_knm = width * deck_thickness * 25 * 9.81 / 1000 + 8.0
+
+    # ── Loads ──
+    # Truss self-weight (estimate: 2-4 kN/m² of deck)
+    truss_self_wt = 3.0 * width  # kN/m
+    total_dl = deck_w_knm + truss_self_wt
+
+    design_lanes = max(1, int(width / 3.6))
+    impact = min(0.33, 1.2 - 0.005 * span)
+    lane_load = 9.3
+    M_ll = (lane_load * span**2 / 8 + 325 * span / 4) * design_lanes * (1 + impact)
+
+    # ── Member Forces (approximate) ──
+    M_total = total_dl * span**2 / 8 + M_ll
+    # Top chord force (at midspan): C = M / h
+    chord_force = M_total / truss_height
+    # Web members: V = wL/2, diagonal force = V / sin(angle)
+    V_max = total_dl * span / 2 + (lane_load * span / 2 + 325) * design_lanes * (1 + impact)
+    diagonal_angle = math.atan(truss_height / panel_length)
+    diagonal_force = V_max / math.sin(diagonal_angle)
+
+    # Chord check (simplified — assume A36 steel, Fa ≈ 0.6*Fy = 150 MPa)
+    chord_steel = STRUCTURAL_STEEL
+    chord_area_req = chord_force / (0.6 * chord_steel["fy_mpa"] * 1000) * 1e6  # mm²
+    chord_weight_kg_per_m = chord_area_req * 7850 / 1e6  # kg/m per chord
+    chord_total_kg = chord_weight_kg_per_m * span * 4  # 4 chords (top+bottom, 2 trusses)
+
+    # Diagonal check
+    diag_area_req = diagonal_force / (0.6 * chord_steel["fy_mpa"] * 1000) * 1e6
+    diag_total_kg = diag_area_req * 7850 / 1e6 * truss_height / math.sin(diagonal_angle) * n_panels * 2
+
+    total_steel_tonnes = (chord_total_kg + diag_total_kg) / 1000 * 1.15  # +15% connections/gussets
+
+    print(f"  Truss: Pratt, height={truss_height:.1f}m, {n_panels} panels @ {panel_length:.1f}m")
+    print(f"  Top chord: {top_chord_section}, Bottom: {bot_chord_section}")
+    print(f"  Diagonals: {diagonal_section}")
+    print(f"  Chord force: {chord_force:.0f} kN, Diagonal force: {diagonal_force:.0f} kN")
+    print(f"  Steel: {total_steel_tonnes:.1f} tonnes")
+    print(f"  Chord steel area req: {chord_area_req:.0f} mm²")
+    print(f"  Span/depth: {span/truss_height:.1f}")
+
+    deck_conc = span * width * deck_thickness
+    print(f"  Concrete deck: {deck_conc:.0f} m³")
+
+    return {
+        "bridge_type": "steel_truss",
+        "design_code": "",
+        "superstructure": {
+            "girder_type": "Steel Pratt Truss",
+            "truss_height_m": round(truss_height, 1),
+            "n_panels": n_panels,
+            "panel_length_m": round(panel_length, 1),
+            "top_chord": top_chord_section,
+            "bottom_chord": bot_chord_section,
+            "diagonals": diagonal_section,
+            "deck_thickness": deck_thickness,
+        },
+        "substructure": design_substructure(
+            params.get("pier_positions", []),
+            params.get("abutment_positions", []),
+            width, clearance, truss_height, deck_thickness
+        ),
+        "reinforcement": {
+            "chord_type": "Built-up H-section",
+            "diagonal_type": "Double angle",
+            "connections": "Gusset plates, HS bolts",
+            "deck_rebar": "16mm @ 150mm",
+        },
+        "quantities": {
+            "structural_steel_tonnes": round(total_steel_tonnes, 1),
+            "concrete_m3": {"deck_slab": round(deck_conc, 0)},
+            "total_concrete_m3": round(deck_conc, 0),
+        },
+        "loads": {
+            "total_dead_kN_per_m": round(total_dl, 1),
+            "chord_force_max_kN": round(chord_force, 0),
+            "diagonal_force_max_kN": round(diagonal_force, 0),
+        },
+        "analysis": {
+            "chord_area_req_mm2": round(chord_area_req, 0),
+            "diag_area_req_mm2": round(diag_area_req, 0),
+            "span_depth_ratio": round(span / truss_height, 1),
         },
     }
 

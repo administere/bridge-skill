@@ -126,7 +126,7 @@ def run_static_analysis(design):
     """
     bridge_type = design.get("bridge_type", "beam")
 
-    if bridge_type in ("cable_stayed", "arch", "suspension"):
+    if bridge_type in ("cable_stayed", "arch", "suspension", "steel_truss"):
         return {
             "analysis_type": "static",
             "converged": False,
@@ -238,7 +238,7 @@ def run_modal_analysis(design, n_modes=6):
     """
     bridge_type = design.get("bridge_type", "beam")
 
-    if bridge_type in ("cable_stayed", "arch", "suspension"):
+    if bridge_type in ("cable_stayed", "arch", "suspension", "steel_truss"):
         return {
             "analysis_type": "modal",
             "error": f"2D modal analysis not applicable for {bridge_type} bridges.",
